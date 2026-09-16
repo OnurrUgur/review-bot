@@ -11,6 +11,10 @@ keep `## [Unreleased]` up to date as changes land. To cut a release, rename
 
 ## [Unreleased]
 
+### Changed
+
+- Gemini's default model is now `gemini-3.1-pro-high`. When Antigravity CLI (`agy`) is on PATH, the Gemini reviewer uses it instead of the retired personal Gemini Code Assist login. The small-model warning no longer treats Gemini Pro as experimental just because the word "gemini" contains "mini".
+
 ## [0.1.17-rc.1] - 2026-09-12
 
 A release candidate for 0.1.17, published to test the new Gemini reviewer before

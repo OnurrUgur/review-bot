@@ -1297,9 +1297,19 @@ actor ReviewEngine {
             )
         }
         do {
+            let usesAntigravity = await commandExists("agy")
             let result = try await runner.run(
-                "gemini",
-                arguments: [
+                usesAntigravity ? "agy" : "gemini",
+                arguments: usesAntigravity
+                    ? [
+                        "--model", configuration.model,
+                        "--add-dir", worktree.path,
+                        "--mode", "plan",
+                        "--sandbox",
+                        "--output-format", "json",
+                        "--prompt", prompt,
+                    ]
+                    : [
                     "--model", configuration.model,
                     "--policy", paths.geminiPolicyFile.path,
                     // The worktree is a scratch checkout the user has never opened,
@@ -1371,6 +1381,7 @@ actor ReviewEngine {
     /// `gemini --output-format json` wraps the answer in `{"response": …}`, which
     /// keeps the reviewer's Markdown clean of the CLI's own chatter. Falls back to
     /// raw stdout so a build that prints plain text still yields a parsable verdict.
+    /// Antigravity CLI (`agy`) uses the same `response` key.
     static func geminiResponse(_ stdout: String) -> String {
         struct Payload: Decodable { let response: String }
         guard let payload = try? JSONDecoder().decode(
@@ -1380,6 +1391,13 @@ actor ReviewEngine {
             return stdout
         }
         return payload.response
+    }
+
+    /// Personal Gemini Code Assist logins no longer work; Antigravity CLI (`agy`)
+    /// is the replacement when it is on PATH.
+    private func commandExists(_ executable: String) async -> Bool {
+        let result = try? await runner.run("which", arguments: [executable], timeout: 10)
+        return result?.succeeded == true
     }
 
     private func failedReviewer(
