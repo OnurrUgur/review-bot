@@ -11,6 +11,10 @@ keep `## [Unreleased]` up to date as changes land. To cut a release, rename
 
 ## [Unreleased]
 
+### Fixed
+
+- **A release pull request is no longer judged against a stale copy of its own head branch.** Review Bot fetched the pull request ref and the base branch but never the head branch, so the clone kept whatever `origin/<head>` it last fetched, and reviewers that read the clone's refs saw it. On a release pull request (head `develop`) two reviewers read an `origin/develop` one commit behind the head, concluded the pull request was a side branch into `main`, and requested changes. A same-repository head branch is now fetched with the rest; a head that moved since the request was discovered aborts the review so the next poll reviews the new one; and the reviewers' prompt (and the reconciliation prompt) states the base branch, the head branch and where it lives, the commit under review and the freshly fetched head tip, and warns that every other local ref may be stale.
+
 ## [0.1.16] - 2026-09-09
 
 ### Added
