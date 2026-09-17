@@ -430,8 +430,11 @@ final class ReviewEngineFeatureTests: XCTestCase {
         XCTAssertEqual(arguments.firstIndex(of: "--model").map { arguments[$0 + 1] }, "gemini-3.1-pro-high")
         let addDir = arguments.firstIndex(of: "--add-dir").map { arguments[$0 + 1] }
         XCTAssertEqual(addDir?.hasPrefix(fixture.paths.worktreesDirectory.path), true)
-        XCTAssertEqual(arguments.firstIndex(of: "--mode").map { arguments[$0 + 1] }, "plan")
+        // `--mode plan` prepends `/plan`, so the agent outlines a review instead of
+        // writing one — and the parser then reports "returned no verdict".
+        XCTAssertFalse(arguments.contains("--mode"))
         XCTAssertTrue(arguments.contains("--sandbox"))
+        XCTAssertEqual(arguments.firstIndex(of: "--print-timeout").map { arguments[$0 + 1] }, "15m")
         XCTAssertEqual(arguments.firstIndex(of: "--output-format").map { arguments[$0 + 1] }, "json")
         XCTAssertFalse(arguments.contains("--policy"))
         XCTAssertFalse(arguments.contains("--skip-trust"))
