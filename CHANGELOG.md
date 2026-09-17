@@ -11,6 +11,10 @@ keep `## [Unreleased]` up to date as changes land. To cut a release, rename
 
 ## [Unreleased]
 
+### Fixed
+
+- **The merge preview no longer reports a release pull request as behind its base when the base changed nothing.** A release pull request (base `main`, head `develop`) is merged with a merge commit, so `main` collects commits `develop` never receives while its tree stays equal to the `develop` commit each release shipped. The preview counted those merges as the base having moved — "`main` has moved 6 commits ahead" with nothing to show for it — a number that grew with every release and that reviewers read as evidence of a stale side branch. Once the base is behind, the preview now checks `git diff --quiet --no-ext-diff <merge-base> <base>` first: identical trees mean no preview at all. A real content change, or a probe that cannot answer, keeps the preview exactly as before.
+
 ## [0.1.16] - 2026-09-09
 
 ### Added
