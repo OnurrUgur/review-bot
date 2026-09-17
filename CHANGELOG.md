@@ -11,6 +11,10 @@ keep `## [Unreleased]` up to date as changes land. To cut a release, rename
 
 ## [Unreleased]
 
+### Changed
+
+- **A partial panel can no longer approve a pull request.** When an enabled reviewer failed, timed out, or returned no verdict while at least one other reviewer finished, Review Bot posted whatever the survivors decided — including an approval — with only a blockquote in the review body disclosing that the panel was incomplete. On a production release pull request, one reviewer hit a terminal failure ("You've hit your weekly limit · resets 4pm (Europe/London)") and the surviving reviewer's clean verdict posted as **Approved**, indistinguishable at a glance from a full panel's approval. `DecisionEvaluator.withholdingApprovalFromPartialPanel` now downgrades an approval reached by a partial panel to a neutral comment that names the missing reviewer and why no approval was given; a partial panel can still request changes or comment, since those findings are still real. A review with no verdict at all is unaffected — nothing is posted, as before. `ReviewerFailureClass.classify` also recognizes the exhausted-weekly-quota message as terminal, so that failure is not retried within the same review.
+
 ## [0.1.16] - 2026-09-09
 
 ### Added
