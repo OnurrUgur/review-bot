@@ -11,6 +11,10 @@ keep `## [Unreleased]` up to date as changes land. To cut a release, rename
 
 ## [Unreleased]
 
+### Fixed
+
+- **A review that says it found no merge blocker is no longer downgraded for mentioning one.** The injection guard downgrades an approval whose own prose describes a merge blocker, but it matched phrases such as "merge-blocking" with no sense of negation, so "I found no merge-blocking defect, only two small tooling polish items below" turned a legitimate `NITS_ONLY` approval into a neutral comment. A phrase no longer counts when its clause opens with a negator ("no", "not", "nothing", "without", "…n't") reached across a short, closed list of neutral words, or when it is answered by a complete "…: none". It still counts when the negation is doubled ("no reason not to hold the merge"), when the clause names an exception or a comparison ("no merge-blocking defect other than the migration"), or when any other phrase in the review is not negated — a false positive only costs an approval, a false negative lets a contradictory one through.
+
 ## [0.1.16] - 2026-09-09
 
 ### Added
