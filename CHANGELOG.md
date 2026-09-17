@@ -11,6 +11,10 @@ keep `## [Unreleased]` up to date as changes land. To cut a release, rename
 
 ## [Unreleased]
 
+### Fixed
+
+- **A review is no longer recorded against a commit nobody reviewed.** Reviews were submitted with `gh pr review`, which cannot name a commit, so GitHub attached each one to whatever the pull request's head had become by the time the review finished. A push that landed mid-review received an approval meant for the previous commit — on a production release pull request, it counted toward the required approvals. The head is now re-read just before posting and nothing is posted if it moved (the next poll reviews the new commit). As a backstop for the moment between that check and the post, the review is submitted through the pull request reviews API with `commit_id` pinned to the reviewed commit.
+
 ## [0.1.16] - 2026-09-09
 
 ### Added
