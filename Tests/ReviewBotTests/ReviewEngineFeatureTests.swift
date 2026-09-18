@@ -496,6 +496,40 @@ final class ReviewEngineFeatureTests: XCTestCase {
         XCTAssertTrue(postedBody.contains("contradicts its verdict"))
     }
 
+    func testNegatedMergeBlockerProseDoesNotDowngradeApproval() async throws {
+        // The bug this guards against: on a real release PR, `bodySaysUnmergeable`
+        // fired on "no merge-blocking defect" with no awareness of the leading
+        // negation, downgrading a legitimate NITS_ONLY approval to a comment.
+        let sentences = [
+            "I sampled the executable tooling, config, and Dockerfile closely; I found no merge-blocking defect, only two small tooling polish items below.",
+            "I sampled the promotion-time risks and read both new tools end-to-end; I found no merge-blocking or should-fix defect.",
+        ]
+        for sentence in sentences {
+            // Fresh fixture/mock/engine per sentence — a reused fixture would treat
+            // the second run as an already-reviewed request and skip it.
+            let fixture = try FeatureFixture()
+            let runner = ReviewWorkflowMock(
+                claudeVerdict: .nitsOnly,
+                opencodeVerdict: .nitsOnly,
+                opencodeBody: sentence
+            )
+            let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+            var configuration = fixture.configuration
+            configuration.opencode.enabled = true
+
+            await engine.poll(
+                configuration: configuration,
+                onEvent: { _ in },
+                onStatus: { _ in }
+            )
+
+            let postArgument = await runner.lastPostArgument()
+            let postedBody = await runner.lastPostedBody()
+            XCTAssertEqual(postArgument, "--approve", "false positive for: \(sentence)")
+            XCTAssertFalse(postedBody.contains("contradicts its verdict"), "false positive for: \(sentence)")
+        }
+    }
+
     func testCleanApprovalWithoutInjectionSignalsPostsApproval() async throws {
         let fixture = try FeatureFixture()
         let runner = ReviewWorkflowMock()
@@ -1255,6 +1289,7 @@ private actor ReviewWorkflowMock: CommandRunning {
     private let emptyTimeline: Bool
     private let conversationText: String
     private let claudeBody: String
+    private let opencodeBody: String
     private let baseCommitsAhead: Int
     private let trackedBaseOid: String?
     private let baseTreeDiffExitCode: Int32
@@ -1284,6 +1319,7 @@ private actor ReviewWorkflowMock: CommandRunning {
         emptyTimeline: Bool = false,
         conversationText: String = "PR conversation",
         claudeBody: String = "Looks safe.",
+        opencodeBody: String = "opencode result.",
         /// Commits the base branch has gained since the merge base. `0` — the default — means the
         /// pull request is current with its base, so `mergePreview` returns before issuing any
         /// further plumbing and every other test's command sequence is unchanged.
@@ -1310,6 +1346,7 @@ private actor ReviewWorkflowMock: CommandRunning {
         self.emptyTimeline = emptyTimeline
         self.conversationText = conversationText
         self.claudeBody = claudeBody
+        self.opencodeBody = opencodeBody
         self.baseCommitsAhead = baseCommitsAhead
         self.trackedBaseOid = trackedBaseOid
         self.baseTreeDiffExitCode = baseTreeDiffExitCode
@@ -1471,7 +1508,7 @@ private actor ReviewWorkflowMock: CommandRunning {
         }
         if executable == "opencode" {
             opencodeRuns += 1
-            return result(stdout: "## Summary\nopencode result.\n\nVERDICT: \(opencodeVerdict.rawValue)\n")
+            return result(stdout: "## Summary\n\(opencodeBody)\n\nVERDICT: \(opencodeVerdict.rawValue)\n")
         }
         if executable == "gh", arguments.starts(with: ["pr", "review", "42"]) {
             posts += 1
