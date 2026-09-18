@@ -2,6 +2,23 @@ import Foundation
 import XCTest
 @testable import ReviewBot
 
+/// Strips `-p`, `--model`, and `--effort` — and the value that follows each — from a captured
+/// `claude` argument list, leaving only the sandboxing and output flags to compare against.
+private func withoutPromptModelAndEffort(_ arguments: [String]) -> [String] {
+    let strippedFlags: Set<String> = ["-p", "--model", "--effort"]
+    var result: [String] = []
+    var index = 0
+    while index < arguments.count {
+        if strippedFlags.contains(arguments[index]) {
+            index += 2
+            continue
+        }
+        result.append(arguments[index])
+        index += 1
+    }
+    return result
+}
+
 final class ReviewEngineFeatureTests: XCTestCase {
     func testCleanReviewRunsInWorktreeUsesRepositoryRulesAndPostsApproval() async throws {
         let fixture = try FeatureFixture()
@@ -305,6 +322,47 @@ final class ReviewEngineFeatureTests: XCTestCase {
         // Codex from adjudication must not also hide that it was missing.
         let postedBody = await runner.lastPostedBody()
         XCTAssertTrue(postedBody.contains("Partial panel"))
+    }
+
+    func testClaudeRunsWithOnlyReadToolsAndNoPullRequestSettings() async throws {
+        // Disagreement between Claude and Codex triggers reconciliation, so this fixture
+        // produces one ordinary claude run and one reconciliation run — both must be sandboxed
+        // identically, since `runClaude` backs both call sites.
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock(
+            claudeVerdict: .clean,
+            codexVerdict: .shouldFix,
+            reconciledVerdict: .clean
+        )
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+        var configuration = fixture.configuration
+        configuration.claude.enabled = true
+        configuration.codex.enabled = true
+
+        await engine.poll(configuration: configuration, onEvent: { _ in }, onStatus: { _ in })
+
+        let invocations = await runner.claudeInvocations()
+        XCTAssertEqual(invocations.count, 2, "one ordinary review plus one reconciliation pass")
+        for arguments in invocations {
+            XCTAssertEqual(
+                withoutPromptModelAndEffort(arguments),
+                [
+                    "--tools", "Read,Grep,Glob",
+                    "--permission-mode", "dontAsk",
+                    "--setting-sources", "user",
+                    "--settings", #"{"disableAllHooks":true}"#,
+                    "--strict-mcp-config",
+                    "--disallowedTools", "mcp__*",
+                    "--output-format", "text",
+                ]
+            )
+            XCTAssertFalse(arguments.contains("--allowedTools"))
+            XCTAssertFalse(arguments.contains("--allowed-tools"))
+            XCTAssertFalse(arguments.contains("--dangerously-skip-permissions"))
+            XCTAssertFalse(arguments.contains("--add-dir"))
+            XCTAssertFalse(arguments.contains("--mcp-config"))
+            XCTAssertEqual(arguments.filter { $0 == "-p" }.count, 1)
+        }
     }
 
     func testCodexOnlyShouldFixVerdictRequestsChanges() async throws {
@@ -900,6 +958,100 @@ final class ReviewEngineFeatureTests: XCTestCase {
         XCTAssertTrue(prompt.contains("## Pull request facts"))
     }
 
+    /// Regression: a release pull request (base `main`, head `develop`) is merged with a merge
+    /// commit on every release, so `main` accumulates commits `develop` never receives even though
+    /// `main`'s tree after each release is exactly the tree of the `develop` commit it released.
+    /// `behind` alone counted every past release merge as the base having moved. The content probe
+    /// this guards must see the identical tree and suppress the preview entirely — no file, and
+    /// none of the plumbing after it (`merge-tree` included) is worth paying for.
+    func testMergePreviewIsSuppressedWhenTheBaseTreeIsIdenticalDespiteCommitsBetween() async throws {
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock(baseCommitsAhead: 6, baseTreeDiffExitCode: 0)
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+        let recorder = EventRecorder()
+
+        await engine.poll(
+            configuration: fixture.configuration,
+            onEvent: { entry in await recorder.append(entry) },
+            onStatus: { _ in }
+        )
+
+        // Bound before asserting: XCTUnwrap takes an @autoclosure, which cannot carry an `await`.
+        let preview = await runner.mergePreviewDuringReview()
+        let mergeTreeCalls = await runner.mergeTreeCallCount()
+        let capturedProbe = await runner.baseTreeDiffInvocation()
+        let probe = try XCTUnwrap(capturedProbe)
+        let events = await recorder.snapshot()
+        XCTAssertNil(preview, "an identical tree is not a merge risk, however many release merges sit between")
+        XCTAssertEqual(mergeTreeCalls, 0, "the rest of the plumbing must be skipped once the probe proves the trees match")
+        XCTAssertTrue(probe.contains("diff"))
+        XCTAssertTrue(probe.contains("--quiet"))
+        XCTAssertTrue(probe.contains("--no-ext-diff"))
+        let mergeBaseIndex = try XCTUnwrap(probe.firstIndex(of: "aaaaaaaabbbbbbbb"))
+        let baseIndex = try XCTUnwrap(probe.firstIndex(of: "trackedbaseoid00"))
+        XCTAssertTrue(mergeBaseIndex < baseIndex, "the probe must diff merge-base..base, not the other order")
+        XCTAssertEqual(events.map(\.kind), [.requestDetected, .reviewStarted, .approved])
+    }
+
+    /// Pair to the identical-tree case above: when the base genuinely changed content, the probe
+    /// must not suppress anything — the preview is built exactly as it was before this guard.
+    func testMergePreviewStillReportsWhenTheBaseTreeActuallyChanged() async throws {
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock(baseCommitsAhead: 6, baseTreeDiffExitCode: 1)
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+        let recorder = EventRecorder()
+
+        await engine.poll(
+            configuration: fixture.configuration,
+            onEvent: { entry in await recorder.append(entry) },
+            onStatus: { _ in }
+        )
+
+        let captured = await runner.mergePreviewDuringReview()
+        let preview = try XCTUnwrap(captured)
+        let mergeTreeCalls = await runner.mergeTreeCallCount()
+        XCTAssertTrue(preview.contains("`main` has moved 6 commits ahead"))
+        XCTAssertEqual(mergeTreeCalls, 1)
+    }
+
+    /// A probe that cannot answer — here git exiting 128 — is not evidence the trees match.
+    /// Treating anything but a clean 0 as "not proven clean" means the preview keeps reporting
+    /// rather than going silent on a guess.
+    func testMergePreviewStillReportsWhenTheContentProbeFailsToAnswer() async throws {
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock(baseCommitsAhead: 2, baseTreeDiffExitCode: 128)
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+        let recorder = EventRecorder()
+
+        await engine.poll(
+            configuration: fixture.configuration,
+            onEvent: { entry in await recorder.append(entry) },
+            onStatus: { _ in }
+        )
+
+        let captured = await runner.mergePreviewDuringReview()
+        let preview = try XCTUnwrap(captured)
+        XCTAssertTrue(preview.contains("`main` has moved 2 commits ahead"))
+    }
+
+    /// When the pull request is already current with its base, `mergePreview` returns before it
+    /// ever reaches the content probe (`behind` is 0) — so the probe must never run at all.
+    func testMergePreviewProbeIsSkippedWhenThePullRequestIsCurrentWithItsBase() async throws {
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock()  // baseCommitsAhead: 0
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+        let recorder = EventRecorder()
+
+        await engine.poll(
+            configuration: fixture.configuration,
+            onEvent: { entry in await recorder.append(entry) },
+            onStatus: { _ in }
+        )
+
+        let probe = await runner.baseTreeDiffInvocation()
+        XCTAssertNil(probe)
+    }
+
     func testReviewRoundCapSkipsPullRequestOnceLimitReached() async throws {
         let fixture = try FeatureFixture()
         // Two prior review rounds already recorded for PR #42.
@@ -1262,6 +1414,9 @@ private actor EventRecorder {
 private actor ReviewWorkflowMock: CommandRunning {
     private var posts = 0
     private var claudeRuns = 0
+    /// Every `claude` invocation's full argument array, in call order — an ordinary review and,
+    /// when one runs, the reconciliation pass are both recorded here.
+    private var claudeArgumentLists: [[String]] = []
     private var codexRuns = 0
     private var opencodeRuns = 0
     private var reconciliationRuns = 0
@@ -1295,6 +1450,7 @@ private actor ReviewWorkflowMock: CommandRunning {
     private let isCrossRepository: Bool?
     private let githubHeadTip: String
     private let failHeadRevParse: Bool
+    private let baseTreeDiffExitCode: Int32
 
     /// The base ref OID GitHub reports in `gh pr view`. Kept as a constant because the mock's
     /// `rev-list` has to distinguish it from the remote-tracking OID to reproduce the bug.
@@ -1309,6 +1465,8 @@ private actor ReviewWorkflowMock: CommandRunning {
     /// Seeded with a pre-existing (stale) value so a test can prove the fetch overwrites it before
     /// anything reads it back.
     private var trackingRefs: [String: String]
+    private var baseTreeDiffArgs: [String]?
+    private var mergeTreeCalls = 0
 
     init(
         failFirstPost: Bool = false,
@@ -1350,7 +1508,12 @@ private actor ReviewWorkflowMock: CommandRunning {
         githubHeadTip: String = "1234567890abcdef",
         /// Makes the checkout gate's post-fetch `rev-parse` of the head branch fail, modelling a
         /// read-back that could not resolve the ref it had just fetched.
-        failHeadRevParse: Bool = false
+        failHeadRevParse: Bool = false,
+        /// Exit code for the `git diff --quiet --no-ext-diff <mergeBase> <base>` content probe.
+        /// `1` — the default — is "the base changed content", which is what every merge-preview
+        /// test before this one already assumes, so it keeps their behaviour unchanged. `0` is
+        /// "identical trees" (the release-PR case); anything else simulates an unreadable answer.
+        baseTreeDiffExitCode: Int32 = 1
     ) {
         self.failFirstPost = failFirstPost
         self.claudeVerdict = claudeVerdict
@@ -1376,6 +1539,7 @@ private actor ReviewWorkflowMock: CommandRunning {
         } else {
             trackingRefs = [:]
         }
+        self.baseTreeDiffExitCode = baseTreeDiffExitCode
     }
 
     func run(
@@ -1466,11 +1630,18 @@ private actor ReviewWorkflowMock: CommandRunning {
             return result(stdout: "\(range.hasSuffix("..\(liveBase)") ? baseCommitsAhead : 0)\n")
         }
         if executable == "git", arguments.contains("merge-tree") {
+            mergeTreeCalls += 1
             // Exit 1 is git's "merged, with conflicts" — an answer, not a failure.
             return result(
                 exitCode: 1,
                 stdout: "treeoid\nshared.swift\n\nCONFLICT (content): Merge conflict in shared.swift\n"
             )
+        }
+        // Must precede the generic `git diff` branch below, which would otherwise answer this probe
+        // and overwrite the `incrementalDiffArgs` the scope tests assert on.
+        if executable == "git", arguments.contains("diff"), arguments.contains("--quiet") {
+            baseTreeDiffArgs = arguments
+            return result(exitCode: baseTreeDiffExitCode)
         }
         if executable == "git", arguments.contains("--name-only") {
             let forHead = arguments.last == "1234567890abcdef"
@@ -1502,6 +1673,7 @@ private actor ReviewWorkflowMock: CommandRunning {
             return result(stdout: "No inline comments")
         }
         if executable == "claude" {
+            claudeArgumentLists.append(arguments)
             let prompt = arguments.firstIndex(of: "-p").flatMap { index in
                 arguments.indices.contains(index + 1) ? arguments[index + 1] : nil
             } ?? ""
@@ -1577,6 +1749,7 @@ private actor ReviewWorkflowMock: CommandRunning {
 
     func postCount() -> Int { posts }
     func claudeCount() -> Int { claudeRuns }
+    func claudeInvocations() -> [[String]] { claudeArgumentLists }
     func codexCount() -> Int { codexRuns }
     func opencodeCount() -> Int { opencodeRuns }
     func reconciliationCount() -> Int { reconciliationRuns }
@@ -1600,6 +1773,8 @@ private actor ReviewWorkflowMock: CommandRunning {
     func didCallGhPrDiff() -> Bool { ghPrDiffCalled }
     func timelineCallCount() -> Int { timelineCalls }
     func incrementalDiffInvocation() -> [String]? { incrementalDiffArgs }
+    func baseTreeDiffInvocation() -> [String]? { baseTreeDiffArgs }
+    func mergeTreeCallCount() -> Int { mergeTreeCalls }
 
     /// The `gh pr view --json` response, omitting `headRefName`/`isCrossRepository` when their
     /// value is `nil` — a response missing those keys must still decode.
