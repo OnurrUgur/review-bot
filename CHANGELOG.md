@@ -11,6 +11,8 @@ keep `## [Unreleased]` up to date as changes land. To cut a release, rename
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-09-18
+
 ### Added
 
 - **Gemini joins Claude, Codex, and opencode as a reviewer.** It is off by default and, once enabled on the dashboard, runs alongside the others in the same parallel panel, contributes a verdict to the same strictest-wins gate, and can adjudicate a reconciliation when neither Claude nor Codex is enabled. It runs headless (`gemini --prompt … --output-format json`) against the review worktree. Defaults to `gemini-3-pro-preview`. Previewed in 0.1.17-rc.1, which was cut from its own branch and so never reached the release line.
@@ -211,7 +213,8 @@ behaviour; every other reviewer works exactly as it did in 0.1.16.
 - Strictest-verdict decision posted through `gh pr review`, with deduplication, activity history, logs, and saved review Markdown.
 - DMG packaging and a tagged-release workflow that builds and publishes the app.
 
-[Unreleased]: https://github.com/melihucar/review-bot/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/melihucar/review-bot/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/melihucar/review-bot/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/melihucar/review-bot/compare/v0.1.16...v0.2.0
 [0.1.17-rc.1]: https://github.com/melihucar/review-bot/compare/v0.1.16...v0.1.17-rc.1
 [0.1.16]: https://github.com/melihucar/review-bot/compare/v0.1.15...v0.1.16
