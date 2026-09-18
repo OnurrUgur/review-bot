@@ -2,6 +2,23 @@ import Foundation
 import XCTest
 @testable import ReviewBot
 
+/// Strips `-p`, `--model`, and `--effort` — and the value that follows each — from a captured
+/// `claude` argument list, leaving only the sandboxing and output flags to compare against.
+private func withoutPromptModelAndEffort(_ arguments: [String]) -> [String] {
+    let strippedFlags: Set<String> = ["-p", "--model", "--effort"]
+    var result: [String] = []
+    var index = 0
+    while index < arguments.count {
+        if strippedFlags.contains(arguments[index]) {
+            index += 2
+            continue
+        }
+        result.append(arguments[index])
+        index += 1
+    }
+    return result
+}
+
 final class ReviewEngineFeatureTests: XCTestCase {
     func testCleanReviewRunsInWorktreeUsesRepositoryRulesAndPostsApproval() async throws {
         let fixture = try FeatureFixture()
@@ -305,6 +322,47 @@ final class ReviewEngineFeatureTests: XCTestCase {
         // Codex from adjudication must not also hide that it was missing.
         let postedBody = await runner.lastPostedBody()
         XCTAssertTrue(postedBody.contains("Partial panel"))
+    }
+
+    func testClaudeRunsWithOnlyReadToolsAndNoPullRequestSettings() async throws {
+        // Disagreement between Claude and Codex triggers reconciliation, so this fixture
+        // produces one ordinary claude run and one reconciliation run — both must be sandboxed
+        // identically, since `runClaude` backs both call sites.
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock(
+            claudeVerdict: .clean,
+            codexVerdict: .shouldFix,
+            reconciledVerdict: .clean
+        )
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+        var configuration = fixture.configuration
+        configuration.claude.enabled = true
+        configuration.codex.enabled = true
+
+        await engine.poll(configuration: configuration, onEvent: { _ in }, onStatus: { _ in })
+
+        let invocations = await runner.claudeInvocations()
+        XCTAssertEqual(invocations.count, 2, "one ordinary review plus one reconciliation pass")
+        for arguments in invocations {
+            XCTAssertEqual(
+                withoutPromptModelAndEffort(arguments),
+                [
+                    "--tools", "Read,Grep,Glob",
+                    "--permission-mode", "dontAsk",
+                    "--setting-sources", "user",
+                    "--settings", #"{"disableAllHooks":true}"#,
+                    "--strict-mcp-config",
+                    "--disallowedTools", "mcp__*",
+                    "--output-format", "text",
+                ]
+            )
+            XCTAssertFalse(arguments.contains("--allowedTools"))
+            XCTAssertFalse(arguments.contains("--allowed-tools"))
+            XCTAssertFalse(arguments.contains("--dangerously-skip-permissions"))
+            XCTAssertFalse(arguments.contains("--add-dir"))
+            XCTAssertFalse(arguments.contains("--mcp-config"))
+            XCTAssertEqual(arguments.filter { $0 == "-p" }.count, 1)
+        }
     }
 
     func testCodexOnlyShouldFixVerdictRequestsChanges() async throws {
@@ -1167,6 +1225,9 @@ private actor EventRecorder {
 private actor ReviewWorkflowMock: CommandRunning {
     private var posts = 0
     private var claudeRuns = 0
+    /// Every `claude` invocation's full argument array, in call order — an ordinary review and,
+    /// when one runs, the reconciliation pass are both recorded here.
+    private var claudeArgumentLists: [[String]] = []
     private var codexRuns = 0
     private var opencodeRuns = 0
     private var reconciliationRuns = 0
@@ -1363,6 +1424,7 @@ private actor ReviewWorkflowMock: CommandRunning {
             return result(stdout: "No inline comments")
         }
         if executable == "claude" {
+            claudeArgumentLists.append(arguments)
             let prompt = arguments.firstIndex(of: "-p").flatMap { index in
                 arguments.indices.contains(index + 1) ? arguments[index + 1] : nil
             } ?? ""
@@ -1438,6 +1500,7 @@ private actor ReviewWorkflowMock: CommandRunning {
 
     func postCount() -> Int { posts }
     func claudeCount() -> Int { claudeRuns }
+    func claudeInvocations() -> [[String]] { claudeArgumentLists }
     func codexCount() -> Int { codexRuns }
     func opencodeCount() -> Int { opencodeRuns }
     func reconciliationCount() -> Int { reconciliationRuns }

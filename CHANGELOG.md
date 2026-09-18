@@ -15,6 +15,10 @@ keep `## [Unreleased]` up to date as changes land. To cut a release, rename
 
 - **The merge preview no longer reports a release pull request as behind its base when the base changed nothing.** A release pull request (base `main`, head `develop`) is merged with a merge commit, so `main` collects commits `develop` never receives while its tree stays equal to the `develop` commit each release shipped. The preview counted those merges as the base having moved — "`main` has moved 6 commits ahead" with nothing to show for it — a number that grew with every release and that reviewers read as evidence of a stale side branch. Once the base is behind, the preview now checks `git diff --quiet --no-ext-diff <merge-base> <base>` first: identical trees mean no preview at all. A real content change, or a probe that cannot answer, keeps the preview exactly as before.
 
+### Security
+
+- **The Claude reviewer is now confined to reading the pull request's worktree.** A pull request could influence what the Claude reviewer was allowed to do on the reviewer's machine, and a developer's own Claude settings could widen it beyond read-only inspection. Claude now runs with only `Read`, `Grep` and `Glob`, denies anything not pre-approved, ignores the pull request's own Claude settings and MCP configuration, and runs no hooks or MCP servers from the user, project or local settings. It can read the worktree plus whatever the developer's own user settings, or an organization's managed settings, explicitly permit. Developer-visible consequence: your own Claude hooks and MCP servers no longer run during reviews. Verified with Claude Code 2.1.212; update older `claude` CLIs.
+
 ## [0.1.16] - 2026-09-09
 
 ### Added

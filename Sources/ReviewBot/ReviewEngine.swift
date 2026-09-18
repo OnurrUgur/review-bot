@@ -1137,6 +1137,41 @@ actor ReviewEngine {
         return rules.isEmpty ? nil : rules
     }
 
+    /// Hooks are switched off through `--settings` because no tool or permission flag governs
+    /// them, and a hook runs as a command on the reviewer's machine with the pull request's
+    /// worktree as its working directory. `disableAllHooks` turns hooks off from the user, project
+    /// and local sources, the developer's own included. Organization-managed settings outrank
+    /// `--settings` and can still override it; that policy belongs to whoever manages them.
+    private static let claudeSandboxSettingsJSON = #"{"disableAllHooks":true}"#
+
+    /// `runClaude` backs both an ordinary review and the reconciliation pass
+    /// (`runReconciliation`), so every flag here applies to both. Each one closes a specific way
+    /// the reviewer could act on more than the pull request's diff, verified against Claude Code
+    /// 2.1.212:
+    ///
+    /// - `--tools Read,Grep,Glob` limits the built-in tool set to read-only inspection: no shell,
+    ///   no file edits, no web access, no subagents.
+    /// - `--permission-mode dontAsk` denies anything not pre-approved without prompting, and
+    ///   overrides a developer's own default permission mode. Reads inside the working directory
+    ///   (the worktree) are allowed by default; reads outside it are denied.
+    /// - `--allowedTools` is deliberately absent. An allow rule for `Read` is what let reads
+    ///   escape the worktree in the first place, and `--allowedTools` only ever *adds*
+    ///   permissions — it cannot be used to narrow anything.
+    /// - `--setting-sources user`: project and local settings come from the pull request's own
+    ///   tree and must never load. The developer's user settings still load, so provider
+    ///   configuration kept there (`env`, `apiKeyHelper`) keeps working — the standard `claude`
+    ///   login lives in the macOS Keychain and needs no settings at all. Stated honestly: a
+    ///   directory or read rule a developer grants in their own user settings still applies, so
+    ///   the reviewer is confined to the worktree plus whatever the developer's own settings —
+    ///   or an organization's managed settings, which always load — explicitly allow.
+    /// - `--settings claudeSandboxSettingsJSON` turns off hooks, the developer's own included —
+    ///   see `claudeSandboxSettingsJSON` above.
+    /// - `--strict-mcp-config`, with no `--mcp-config` supplied, loads no MCP servers at all —
+    ///   neither the developer's nor an `.mcp.json` the pull request ships.
+    /// - `--disallowedTools mcp__*` is defense in depth in case an MCP server is loaded anyway.
+    ///
+    /// An older `claude` CLI that rejects one of these flags fails the reviewer outright, which
+    /// the posted review discloses like any other reviewer failure.
     private func runClaude(
         configuration: ReviewerConfiguration,
         prompt: String,
@@ -1149,7 +1184,12 @@ actor ReviewEngine {
                     "-p", prompt,
                     "--model", configuration.model,
                     "--effort", configuration.effort.rawValue,
-                    "--allowedTools", "Read", "Grep", "Glob",
+                    "--tools", "Read,Grep,Glob",
+                    "--permission-mode", "dontAsk",
+                    "--setting-sources", "user",
+                    "--settings", Self.claudeSandboxSettingsJSON,
+                    "--strict-mcp-config",
+                    "--disallowedTools", "mcp__*",
                     "--output-format", "text",
                 ],
                 currentDirectory: worktree,
