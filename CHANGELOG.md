@@ -11,6 +11,10 @@ keep `## [Unreleased]` up to date as changes land. To cut a release, rename
 
 ## [Unreleased]
 
+### Changed
+
+- **A partial panel can no longer approve a pull request.** When an enabled reviewer failed, timed out, or returned no verdict while at least one other reviewer finished, Review Bot posted whatever the survivors decided — including an approval — with only a blockquote in the review body disclosing that the panel was incomplete. On a production release pull request, one reviewer hit a terminal failure ("You've hit your weekly limit · resets 4pm (Europe/London)") and the surviving reviewer's clean verdict posted as **Approved**, indistinguishable at a glance from a full panel's approval. `DecisionEvaluator.withholdingApprovalFromPartialPanel` now downgrades an approval reached by a partial panel to a neutral comment that names the missing reviewer and why no approval was given; a partial panel can still request changes or comment, since those findings are still real. A review with no verdict at all is unaffected — nothing is posted, as before. `ReviewerFailureClass.classify` also recognizes the exhausted-weekly-quota message as terminal, so that failure is not retried within the same review.
+
 ### Fixed
 
 - **A release pull request is no longer judged against a stale copy of its own head branch.** Review Bot fetched the pull request ref and the base branch but never the head branch, so the clone kept whatever `origin/<head>` it last fetched, and reviewers that read the clone's refs saw it. On a release pull request (head `develop`) two reviewers read an `origin/develop` one commit behind the head, concluded the pull request was a side branch into `main`, and requested changes. A same-repository head branch is now fetched with the rest; a head that moved since the request was discovered aborts the review so the next poll reviews the new one; and the reviewers' prompt (and the reconciliation prompt) states the base branch, the head branch and where it lives, the commit under review and the freshly fetched head tip, and warns that every other local ref may be stale.
