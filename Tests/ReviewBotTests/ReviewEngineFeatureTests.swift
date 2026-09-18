@@ -107,16 +107,108 @@ final class ReviewEngineFeatureTests: XCTestCase {
         let postCount = await runner.postCount()
         let codexCount = await runner.codexCount()
         let body = await runner.lastPostedBody()
+        let postArgument = await runner.lastPostArgument()
         XCTAssertEqual(codexCount, 2, "The failure is unrecognised, so it is still retried in place")
         XCTAssertEqual(postCount, 1, "Claude's findings are posted rather than thrown away")
-        XCTAssertTrue(events.contains(where: { $0.kind == .approved }))
+        // A partial panel never approves — Claude's CLEAN alone posts as a neutral comment.
+        XCTAssertEqual(postArgument, "--comment")
+        XCTAssertTrue(events.contains(where: { $0.kind == .commented }))
         XCTAssertFalse(events.contains(where: { $0.kind == .failed }))
-        // The author has to be able to tell a one-reviewer approval from a unanimous one.
+        // The author has to be able to tell a one-reviewer decision from a unanimous one.
         XCTAssertTrue(body.contains("Partial panel"))
         XCTAssertTrue(body.contains("**Codex**"))
         XCTAssertTrue(body.contains("simulated codex failure"))
+        XCTAssertTrue(body.contains("a partial panel never approves"))
         // A reviewer with no review body gets no empty disclosure triangle.
         XCTAssertFalse(body.contains("<strong>Codex —"))
+    }
+
+    /// The production-release regression this behavior fixes: Claude hit its exhausted weekly
+    /// quota (a terminal failure — not retried within the review), opencode's lone `CLEAN`
+    /// survived, and the panel posted **Approved** as if it were unanimous.
+    func testAPartialPanelNeverApproves() async throws {
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock(
+            failClaude: true,
+            claudeFailureMessage: "You've hit your weekly limit · resets 4pm (Europe/London)"
+        )
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+        let recorder = EventRecorder()
+        var configuration = fixture.configuration
+        configuration.claude.enabled = true
+        configuration.opencode.enabled = true
+
+        await engine.poll(
+            configuration: configuration,
+            onEvent: { entry in await recorder.append(entry) },
+            onStatus: { _ in }
+        )
+
+        let events = await recorder.snapshot()
+        let postArgument = await runner.lastPostArgument()
+        let body = await runner.lastPostedBody()
+        let claudeCount = await runner.claudeCount()
+        let opencodeCount = await runner.opencodeCount()
+        XCTAssertEqual(postArgument, "--comment")
+        XCTAssertEqual(events.last?.kind, .commented)
+        XCTAssertTrue(body.contains("Partial panel"))
+        XCTAssertTrue(body.contains("**Claude**"))
+        XCTAssertTrue(body.contains("hit your weekly limit"))
+        XCTAssertTrue(body.contains("a partial panel never approves"))
+        XCTAssertTrue(body.contains("opencode: `CLEAN`"))
+        XCTAssertTrue(events.last?.message.contains("Approval withheld: partial panel.") ?? false)
+        // A terminal failure (exhausted weekly quota) is not re-run inside the same review.
+        XCTAssertEqual(claudeCount, 1)
+        XCTAssertEqual(opencodeCount, 1)
+    }
+
+    /// A policy that already leaves CLEAN to the developer comments for its own reason; the
+    /// partial panel withholds nothing there, so the body must not claim it did.
+    func testAPartialPanelUnderACommentPolicyDoesNotClaimToWithholdAnApproval() async throws {
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock(failCodex: true)
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+        let recorder = EventRecorder()
+        var configuration = fixture.configuration
+        configuration.codex.enabled = true
+        configuration.decisionPolicy = DecisionPolicy(shouldFix: .requestChanges, nitsOnly: .comment, clean: .comment)
+
+        await engine.poll(
+            configuration: configuration,
+            onEvent: { entry in await recorder.append(entry) },
+            onStatus: { _ in }
+        )
+
+        let events = await recorder.snapshot()
+        let postArgument = await runner.lastPostArgument()
+        let body = await runner.lastPostedBody()
+        XCTAssertEqual(postArgument, "--comment")
+        XCTAssertTrue(body.contains("Partial panel"))
+        XCTAssertFalse(body.contains("a partial panel never approves"))
+        XCTAssertFalse(events.last?.message.contains("Approval withheld") ?? true)
+    }
+
+    func testAPartialPanelStillRequestsChanges() async throws {
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock(claudeVerdict: .shouldFix, failCodex: true)
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+        let recorder = EventRecorder()
+        var configuration = fixture.configuration
+        configuration.claude.enabled = true
+        configuration.codex.enabled = true
+
+        await engine.poll(
+            configuration: configuration,
+            onEvent: { entry in await recorder.append(entry) },
+            onStatus: { _ in }
+        )
+
+        let events = await recorder.snapshot()
+        let postArgument = await runner.lastPostArgument()
+        let body = await runner.lastPostedBody()
+        XCTAssertEqual(postArgument, "--request-changes")
+        XCTAssertEqual(events.last?.kind, .changesRequested)
+        XCTAssertTrue(body.contains("Partial panel"))
     }
 
     func testAQuotaFailureSkipsTheInReviewRetry() async throws {
@@ -322,6 +414,12 @@ final class ReviewEngineFeatureTests: XCTestCase {
         // Codex from adjudication must not also hide that it was missing.
         let postedBody = await runner.lastPostedBody()
         XCTAssertTrue(postedBody.contains("Partial panel"))
+
+        // Reconciliation adjudicated CLEAN, but Codex never contributed a verdict — the panel
+        // is still partial, so the adjudicated approval is capped to a neutral comment.
+        let postArgument = await runner.lastPostArgument()
+        XCTAssertEqual(postArgument, "--comment")
+        XCTAssertTrue(postedBody.contains("a partial panel never approves"))
     }
 
     func testClaudeRunsWithOnlyReadToolsAndNoPullRequestSettings() async throws {
@@ -1272,9 +1370,12 @@ final class ReviewEngineFeatureTests: XCTestCase {
         let codexRuns = await runner.codexCount()
         let posts = await runner.postCount()
         let body = await runner.lastPostedBody()
+        let postArgument = await runner.lastPostArgument()
         XCTAssertEqual(codexRuns, 1, "Re-running a timeout would just spend the timeout again")
         XCTAssertEqual(posts, 1, "Claude finished, so its review posts without waiting for codex")
         XCTAssertTrue(body.contains("**Codex** (timed out)"))
+        // Claude alone is CLEAN, but the panel is partial — a partial panel never approves.
+        XCTAssertEqual(postArgument, "--comment")
     }
 
     func testASoleReviewerTimingOutPostsNothing() async throws {
@@ -1595,6 +1696,8 @@ private actor ReviewWorkflowMock: CommandRunning {
     private let reconciledVerdict: ReviewVerdict?
     private let failCodex: Bool
     private let codexFailureMessage: String
+    private let failClaude: Bool
+    private let claudeFailureMessage: String
     private let codexFailuresBeforeSuccess: Int
     private let codexTimesOut: Bool
     private let failTimeline: Bool
@@ -1638,6 +1741,11 @@ private actor ReviewWorkflowMock: CommandRunning {
         /// What the failing `codex` writes to stderr. The default is unrecognisable, so it
         /// classifies as transient; pass a quota or auth message to exercise the terminal path.
         codexFailureMessage: String = "simulated codex failure",
+        /// When set, every ordinary (non-reconciliation) `claude` invocation fails instead of
+        /// producing a verdict. Reconciliation is unaffected — it goes through a separate branch
+        /// keyed on the prompt heading, not this flag.
+        failClaude: Bool = false,
+        claudeFailureMessage: String = "simulated claude failure",
         codexFailuresBeforeSuccess: Int = 0,
         codexTimesOut: Bool = false,
         failTimeline: Bool = false,
@@ -1690,6 +1798,8 @@ private actor ReviewWorkflowMock: CommandRunning {
         self.reconciledVerdict = reconciledVerdict
         self.failCodex = failCodex
         self.codexFailureMessage = codexFailureMessage
+        self.failClaude = failClaude
+        self.claudeFailureMessage = claudeFailureMessage
         self.codexFailuresBeforeSuccess = codexFailuresBeforeSuccess
         self.codexTimesOut = codexTimesOut
         self.failTimeline = failTimeline
@@ -1912,6 +2022,9 @@ private actor ReviewWorkflowMock: CommandRunning {
                     contentsOf: currentDirectory.appendingPathComponent(".review-bot-merge.md"),
                     encoding: .utf8
                 )
+            }
+            if failClaude {
+                return result(exitCode: 1, stderr: claudeFailureMessage)
             }
             return result(stdout: "## Summary\n\(claudeBody)\n\nVERDICT: \(claudeVerdict.rawValue)\n")
         }

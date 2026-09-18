@@ -11,6 +11,10 @@ keep `## [Unreleased]` up to date as changes land. To cut a release, rename
 
 ## [Unreleased]
 
+### Changed
+
+- **A partial panel can no longer approve a pull request.** When an enabled reviewer failed, timed out, or returned no verdict while at least one other reviewer finished, Review Bot posted whatever the survivors decided — including an approval — with only a blockquote in the review body disclosing that the panel was incomplete. On a production release pull request, one reviewer hit a terminal failure ("You've hit your weekly limit · resets 4pm (Europe/London)") and the surviving reviewer's clean verdict posted as **Approved**, indistinguishable at a glance from a full panel's approval. `DecisionEvaluator.withholdingApprovalFromPartialPanel` now downgrades an approval reached by a partial panel to a neutral comment that names the missing reviewer and why no approval was given; a partial panel can still request changes or comment, since those findings are still real. A review with no verdict at all is unaffected — nothing is posted, as before. `ReviewerFailureClass.classify` also recognizes the exhausted-weekly-quota message as terminal, so that failure is not retried within the same review.
+
 ### Fixed
 
 - **A review is no longer recorded against a commit nobody reviewed.** Reviews were submitted with `gh pr review`, which cannot name a commit, so GitHub attached each one to whatever the pull request's head had become by the time the review finished. A push that landed mid-review received an approval meant for the previous commit — on a production release pull request, it counted toward the required approvals. The head is now re-read just before posting and nothing is posted if it moved (the next poll reviews the new commit). As a backstop for the moment between that check and the post, the review is submitted through the pull request reviews API with `commit_id` pinned to the reviewed commit.
