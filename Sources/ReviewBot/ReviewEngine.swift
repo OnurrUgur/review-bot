@@ -909,6 +909,19 @@ actor ReviewEngine {
             .flatMap(Int.init) ?? 0
         guard behind > 0 else { return nil }
 
+        // Commits are not content. A release pull request (base `main`, head `develop`) is merged
+        // with a merge commit, so `main` collects commits `develop` never receives while its tree
+        // stays equal to the `develop` commit each release shipped. `behind` counts every one of
+        // those merges, so on its own it describes a base that "moved" without changing a line —
+        // noise that grows with every release, and that reviewers have read as evidence the pull
+        // request is a stale side branch. Exit 0 here means the base changed no content since the
+        // merge base, so there is nothing to preview and "behind N" is never reported. Exit 1 is
+        // a real change; any other answer is unknown, and unknown is not clean — both fall
+        // through. `--no-ext-diff` keeps a configured external diff driver out of a probe whose
+        // exit code decides control flow.
+        let baseTreeDiff = await git(["diff", "--quiet", "--no-ext-diff", mergeBase, base], timeout: 120)
+        if baseTreeDiff?.exitCode == 0 { return nil }
+
         // `merge-tree` exits 1 on conflicts and >1 on real errors (notably a git older than 2.38,
         // which has no `--write-tree`). Only treat 0 and 1 as an answer.
         let mergeTree = await git(["merge-tree", "--write-tree", "--name-only", base, head], timeout: 120)
