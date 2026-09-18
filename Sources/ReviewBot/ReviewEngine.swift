@@ -421,6 +421,10 @@ actor ReviewEngine {
 
             try await checkOutPullRequest(pendingReview, at: worktree)
             worktreeAdded = true
+            // Before any reviewer is started, not inside `runGemini`: the reviewers run
+            // concurrently in this one worktree, so the checkout has to be settled while
+            // nothing is reading it.
+            try ownGeminiWorkspaceConfiguration(in: worktree)
 
             let priorHead = lastReviewed.head(
                 for: "\(repository.githubSlug)#\(pullRequest.number)"
@@ -665,6 +669,58 @@ actor ReviewEngine {
             throw error
         }
         await gitGate.release(repository.githubSlug)
+    }
+
+    /// Replaces the pull request's own Gemini configuration in the scratch checkout
+    /// with Review Bot's.
+    ///
+    /// Gemini CLI reads `<workspace>/.gemini/settings.json` as *executable*
+    /// configuration: `hooks` entries are shell commands it runs around the agent
+    /// loop, and `mcpServers` entries are child processes it spawns. Neither is a
+    /// tool call, so the read-only `--policy` never sees them, and a `SessionStart`
+    /// hook runs before the model is asked anything — the review's own prompt and
+    /// verdict are irrelevant to it. The worktree is checked out at the pull
+    /// request's head, so leaving that path to the branch under review hands it a
+    /// shell on the machine running Review Bot. A `.env` beside it is the same
+    /// story one step removed: the CLI loads it into the environment those children
+    /// inherit.
+    ///
+    /// No flag closes this. The worktree must be *trusted* — a headless run in an
+    /// untrusted folder aborts outright — and trusted is exactly the state in which
+    /// Gemini honours the workspace's settings. Nor can a higher settings tier take
+    /// a hook back: `hooks` entries concatenate across tiers and `mcpServers`
+    /// shallow-merge, so a later tier can only add. What Review Bot does own is the
+    /// checkout it prepared, so it owns this path in it: the branch's `.gemini` and
+    /// `.env` are removed and Review Bot's own settings are written in their place.
+    /// Nothing is hidden from the review — every one of those files is in
+    /// `.review-bot-diff.patch`, which is what the reviewers are told to read.
+    ///
+    /// Done for every review rather than only when Gemini is enabled: the cost is a
+    /// directory in a throwaway checkout, and the alternative is a sandbox that
+    /// silently depends on a settings toggle elsewhere.
+    private func ownGeminiWorkspaceConfiguration(in worktree: URL) throws {
+        let manager = FileManager.default
+        let directory = worktree.appendingPathComponent(".gemini", isDirectory: true)
+        // `removeItem` throws when the path is absent, which is the ordinary case.
+        try? manager.removeItem(at: directory)
+        try? manager.removeItem(at: worktree.appendingPathComponent(".env"))
+        try manager.createDirectory(at: directory, withIntermediateDirectories: true)
+        // Gemini CLI strips comments before parsing, so the file can say why it is
+        // here to whoever opens the worktree — or to a reviewer that reads it.
+        let settings = """
+        // Written by Review Bot, replacing whatever this pull request shipped at
+        // this path. Gemini CLI runs `hooks` as shell commands and spawns
+        // `mcpServers` as child processes, so the branch under review must not own
+        // this file. MCP is blocked at the command line as well.
+        {
+          "hooksConfig": { "enabled": false },
+          "advanced": { "ignoreLocalEnv": true }
+        }
+        """
+        try Data(settings.utf8).write(
+            to: directory.appendingPathComponent("settings.json"),
+            options: .atomic
+        )
     }
 
     private func watchingStatus(repositoryCount: Int, deferredRequests: Int) -> String {
@@ -1304,10 +1360,21 @@ actor ReviewEngine {
                     "--policy", paths.geminiPolicyFile.path,
                     // The worktree is a scratch checkout the user has never opened,
                     // so Gemini would otherwise refuse it as an untrusted folder.
+                    // Trusting it is also what makes `ownGeminiWorkspaceConfiguration`
+                    // necessary: a trusted workspace's `.gemini` is configuration the
+                    // CLI executes.
                     "--skip-trust",
                     // Reviews must not depend on whichever extensions the user
                     // happens to have installed — or on ones the branch ships.
                     "--extensions", "none",
+                    // Gemini has no `--disallowedTools mcp__*`: the only lever is an
+                    // allowlist, and a name no server answers to blocks every one of
+                    // them. That includes the user's own — an MCP tool is not one of
+                    // the names the read-only policy denies, so a configured server
+                    // would hand a reviewer of untrusted code a way out of Read,
+                    // Grep and Glob. The name is generated per run so that a pull
+                    // request cannot claim it by naming a server after the constant.
+                    "--allowed-mcp-server-names", "review-bot-no-mcp-\(UUID().uuidString)",
                     "--output-format", "json",
                     "--prompt", prompt,
                 ],

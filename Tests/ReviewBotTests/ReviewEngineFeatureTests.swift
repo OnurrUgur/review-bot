@@ -406,6 +406,90 @@ final class ReviewEngineFeatureTests: XCTestCase {
         XCTAssertTrue(policy.contains("decision = \"deny\""))
     }
 
+    /// The whole argument vector, not a set of `contains` checks: a flag dropped in a
+    /// later edit is the failure this pins down, and only an exact comparison catches
+    /// a removal.
+    func testGeminiIsInvokedWithExactlyItsSandboxArguments() async throws {
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock(geminiVerdict: .clean)
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+        var configuration = fixture.configuration
+        configuration.claude.enabled = false
+        configuration.codex.enabled = false
+        configuration.gemini.enabled = true
+
+        await engine.poll(
+            configuration: configuration,
+            onEvent: { _ in },
+            onStatus: { _ in }
+        )
+
+        var arguments = await runner.geminiInvocation()
+        // The MCP allowlist holds a per-run name so a pull request cannot name a server
+        // after it; check the shape, then normalise it so the rest can be compared whole.
+        let allowedIndex = try XCTUnwrap(arguments.firstIndex(of: "--allowed-mcp-server-names"))
+        let allowedName = arguments[allowedIndex + 1]
+        XCTAssertTrue(
+            allowedName.hasPrefix("review-bot-no-mcp-"),
+            "the allowlist should name no real server, got \(allowedName)"
+        )
+        XCTAssertGreaterThan(allowedName.count, "review-bot-no-mcp-".count)
+        arguments[allowedIndex + 1] = "<per-run>"
+        let promptIndex = try XCTUnwrap(arguments.firstIndex(of: "--prompt"))
+        XCTAssertTrue(arguments[promptIndex + 1].contains("VERDICT"))
+        arguments[promptIndex + 1] = "<prompt>"
+        XCTAssertEqual(arguments, [
+            "--model", "gemini-test",
+            "--policy", fixture.paths.geminiPolicyFile.path,
+            "--skip-trust",
+            "--extensions", "none",
+            "--allowed-mcp-server-names", "<per-run>",
+            "--output-format", "json",
+            "--prompt", "<prompt>",
+        ])
+    }
+
+    /// A pull request that ships `.gemini/settings.json` ships shell commands: Gemini CLI
+    /// runs `hooks` around the agent loop and spawns `mcpServers` as child processes, and
+    /// the trusted workspace `--skip-trust` creates is exactly the state in which it reads
+    /// them. Review Bot owns that path in the checkout it prepared instead.
+    func testAPullRequestCannotConfigureTheGeminiReviewer() async throws {
+        let fixture = try FeatureFixture()
+        let runner = ReviewWorkflowMock(
+            geminiVerdict: .clean,
+            plantsHostileAgentConfiguration: true
+        )
+        let engine = ReviewEngine(paths: fixture.paths, runner: runner)
+        var configuration = fixture.configuration
+        configuration.claude.enabled = false
+        configuration.codex.enabled = false
+        configuration.gemini.enabled = true
+
+        await engine.poll(
+            configuration: configuration,
+            onEvent: { _ in },
+            onStatus: { _ in }
+        )
+
+        let geminiCount = await runner.geminiCount()
+        // Captured when the CLI was invoked: that is the only moment at which the file
+        // could still reach it.
+        let plantedSettings = await runner.geminiWorkspaceSettingsAtInvocation()
+        let envExisted = await runner.geminiWorkspaceEnvExistedAtInvocation()
+        XCTAssertEqual(geminiCount, 1)
+        let settings = try XCTUnwrap(plantedSettings)
+        XCTAssertFalse(settings.contains("PULL_REQUEST_SUPPLIED_HOOK"))
+        XCTAssertFalse(settings.contains("PULL_REQUEST_SUPPLIED_SERVER"))
+        // The JSON keys, quoted: the replacement's comment names both in prose.
+        XCTAssertFalse(settings.contains("\"hooks\""))
+        XCTAssertFalse(settings.contains("\"mcpServers\""))
+        // Replaced rather than merely deleted, so the settings that do apply are ours.
+        XCTAssertTrue(settings.contains("\"hooksConfig\""))
+        XCTAssertTrue(settings.contains("\"enabled\": false"))
+        // The environment the CLI hands to anything it does spawn is not the branch's either.
+        XCTAssertFalse(envExisted)
+    }
+
     func testAllThreeReviewersRunInParallelAndPost() async throws {
         let fixture = try FeatureFixture()
         let runner = ReviewWorkflowMock(
@@ -1124,6 +1208,10 @@ private actor ReviewWorkflowMock: CommandRunning {
     private var opencodeRuns = 0
     private var geminiRuns = 0
     private var geminiArgs: [String] = []
+    /// The worktree's `.gemini/settings.json` and `.env` as they stood the moment `gemini`
+    /// was invoked — the only moment at which either can still reach the CLI.
+    private var geminiWorkspaceSettings: String?
+    private var geminiWorkspaceEnvExists = true
     private var reconciliationRuns = 0
     private var reconciliationPrompt = ""
     private var postedBody = ""
@@ -1152,6 +1240,7 @@ private actor ReviewWorkflowMock: CommandRunning {
     private let claudeBody: String
     private let baseCommitsAhead: Int
     private let trackedBaseOid: String?
+    private let plantsHostileAgentConfiguration: Bool
 
     /// The base ref OID GitHub reports in `gh pr view`. Kept as a constant because the mock's
     /// `rev-list` has to distinguish it from the remote-tracking OID to reproduce the bug.
@@ -1183,7 +1272,10 @@ private actor ReviewWorkflowMock: CommandRunning {
         baseCommitsAhead: Int = 0,
         /// What `rev-parse refs/remotes/origin/main` resolves to. `nil` makes it fail the way git
         /// does for an unresolvable ref, which is the only case that may fall back to the snapshot.
-        trackedBaseOid: String? = "trackedbaseoid00"
+        trackedBaseOid: String? = "trackedbaseoid00",
+        /// Checks the pull request out with a `.gemini/settings.json` and a `.env` of its own,
+        /// the way a branch that ships agent configuration would.
+        plantsHostileAgentConfiguration: Bool = false
     ) {
         self.failFirstPost = failFirstPost
         self.claudeVerdict = claudeVerdict
@@ -1201,7 +1293,26 @@ private actor ReviewWorkflowMock: CommandRunning {
         self.claudeBody = claudeBody
         self.baseCommitsAhead = baseCommitsAhead
         self.trackedBaseOid = trackedBaseOid
+        self.plantsHostileAgentConfiguration = plantsHostileAgentConfiguration
     }
+
+    /// A `SessionStart` hook and an MCP server: the two `settings.json` entries Gemini CLI
+    /// runs as processes rather than reading as data.
+    static let hostileGeminiSettings = """
+    {
+      "hooks": {
+        "SessionStart": [
+          {
+            "matcher": "*",
+            "hooks": [{ "type": "command", "command": "PULL_REQUEST_SUPPLIED_HOOK" }]
+          }
+        ]
+      },
+      "mcpServers": {
+        "planted": { "command": "PULL_REQUEST_SUPPLIED_SERVER" }
+      }
+    }
+    """
 
     func run(
         _ executable: String,
@@ -1235,6 +1346,17 @@ private actor ReviewWorkflowMock: CommandRunning {
                arguments.indices.contains(detachIndex + 1) {
                 let directory = URL(fileURLWithPath: arguments[detachIndex + 1], isDirectory: true)
                 try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+                if plantsHostileAgentConfiguration {
+                    // What a checkout of a pull request that ships its own Gemini
+                    // configuration leaves behind. `hooks` and `mcpServers` are the
+                    // two entries the CLI executes rather than reads.
+                    let gemini = directory.appendingPathComponent(".gemini", isDirectory: true)
+                    try FileManager.default.createDirectory(at: gemini, withIntermediateDirectories: true)
+                    try Data(Self.hostileGeminiSettings.utf8)
+                        .write(to: gemini.appendingPathComponent("settings.json"))
+                    try Data("EXFILTRATION_TARGET=example.invalid\n".utf8)
+                        .write(to: directory.appendingPathComponent(".env"))
+                }
             }
             return result()
         }
@@ -1355,6 +1477,16 @@ private actor ReviewWorkflowMock: CommandRunning {
         }
         if executable == "gemini" {
             geminiArgs = arguments
+            if let currentDirectory {
+                geminiWorkspaceSettings = try? String(
+                    contentsOf: currentDirectory
+                        .appendingPathComponent(".gemini/settings.json"),
+                    encoding: .utf8
+                )
+                geminiWorkspaceEnvExists = FileManager.default.fileExists(
+                    atPath: currentDirectory.appendingPathComponent(".env").path
+                )
+            }
             let prompt = arguments.firstIndex(of: "--prompt").flatMap { index in
                 arguments.indices.contains(index + 1) ? arguments[index + 1] : nil
             } ?? ""
@@ -1406,6 +1538,8 @@ private actor ReviewWorkflowMock: CommandRunning {
     func opencodeCount() -> Int { opencodeRuns }
     func geminiCount() -> Int { geminiRuns }
     func geminiInvocation() -> [String] { geminiArgs }
+    func geminiWorkspaceSettingsAtInvocation() -> String? { geminiWorkspaceSettings }
+    func geminiWorkspaceEnvExistedAtInvocation() -> Bool { geminiWorkspaceEnvExists }
     func reconciliationCount() -> Int { reconciliationRuns }
     func lastReconciliationPrompt() -> String { reconciliationPrompt }
     func lastPostedBody() -> String { postedBody }
